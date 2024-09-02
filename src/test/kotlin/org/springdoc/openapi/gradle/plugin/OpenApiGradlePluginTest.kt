@@ -1,5 +1,6 @@
 package org.springdoc.openapi.gradle.plugin
 
+import com.beust.klaxon.JsonArray
 import com.beust.klaxon.JsonObject
 import com.beust.klaxon.Parser
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -12,6 +13,7 @@ import org.gradle.testkit.runner.TaskOutcome
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.slf4j.Logger
@@ -119,7 +121,7 @@ class OpenApiGradlePluginTest {
         """.trimMargin()
 		)
 
-		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild("clean")).outcome)
 		assertOpenApiJsonFile(1, buildDir = specialOutputDir)
 	}
 
@@ -215,6 +217,27 @@ class OpenApiGradlePluginTest {
                 apiDocsUrl = "http://localhost:8080/secret-api-docs"
                 customBootRun {
                     args = ["--spring.profiles.active=different-url"]
+                }
+            }
+        """.trimMargin()
+		)
+
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(1)
+	}
+
+	@Test
+	fun `using HTTPS api url to download api-docs`() {
+		val trustStore = File(projectTestDir, "truststore.p12")
+		buildFile.writeText(
+			"""$baseBuildGradle
+				
+            openApi{
+				trustStore = "${trustStore.absolutePath}"
+				trustStorePassword = "changeit".toCharArray()
+                apiDocsUrl = "https://127.0.0.1:8081/v3/api-docs"
+                customBootRun {
+                    args = ["--spring.profiles.active=ssl"]
                 }
             }
         """.trimMargin()
@@ -335,10 +358,92 @@ class OpenApiGradlePluginTest {
 		}
 	}
 
+	@Test
+	fun `adding headers for custom generated url`() {
+		val outputJsonFileName: String = DEFAULT_OPEN_API_FILE_NAME
+		val buildDir: File = projectBuildDir
+		val customHost = "custom-host"
+		val customPort = "7000"
+
+		buildFile.writeText(
+			"""$baseBuildGradle
+		    bootRun {
+                args = ["--server.forward-headers-strategy=framework"]
+            }
+            openApi{
+                outputFileName = "$outputJsonFileName"
+				requestHeaders = [
+				   "x-forwarded-host": "$customHost",
+				   "x-forwarded-port": "$customPort"
+				]
+            }
+        """.trimMargin())
+
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(1, outputJsonFileName)
+		val openApiJson = getOpenApiJsonAtLocation(File(buildDir, outputJsonFileName))
+		val servers: JsonArray<Map<String, String>>? = openApiJson.array("servers")
+		assertTrue(servers!!.any { s -> s.get("url").equals("http://$customHost:$customPort") })
+	}
+
+	@Test
+	fun `running the same build keeps the OpenAPI task up to date`() {
+		buildFile.writeText(
+			"""
+			$baseBuildGradle
+            openApi {}
+			""".trimMargin()
+		)
+
+		// Run the first build to generate the OpenAPI file
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(1)
+
+		// Rerunning the build does not regenerate the OpenAPI file
+		assertEquals(TaskOutcome.UP_TO_DATE, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(1)
+	}
+
+	@Test
+	fun `changing the source code regenerates the OpenAPI`() {
+		buildFile.writeText(
+			"""
+			$baseBuildGradle
+            openApi {}
+			""".trimMargin()
+		)
+
+		// Run the first build to generate the OpenAPI file
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(1)
+
+		val addedFile = projectTestDir.resolve("src/main/java/com/example/demo/endpoints/AddedController.java")
+		addedFile.createNewFile()
+		addedFile.writeText("""
+			package com.example.demo.endpoints;
+
+			import org.springframework.web.bind.annotation.GetMapping;
+			import org.springframework.web.bind.annotation.RestController;
+
+			@RestController
+			public class AddedController {
+
+				@GetMapping("/added")
+				public String added() {
+					return "Added file";
+				}
+			}
+		""".trimIndent())
+
+		// Run the same build with added source file
+		assertEquals(TaskOutcome.SUCCESS, openApiDocsTask(runTheBuild()).outcome)
+		assertOpenApiJsonFile(2)
+	}
+
 	private fun runTheBuild(vararg additionalArguments: String = emptyArray()) =
 		GradleRunner.create()
 			.withProjectDir(projectTestDir)
-			.withArguments("clean", "generateOpenApiDocs", *additionalArguments)
+			.withArguments(*additionalArguments, "generateOpenApiDocs")
 			.withPluginClasspath()
 			.build()
 
